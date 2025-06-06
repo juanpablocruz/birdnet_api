@@ -13,6 +13,9 @@ from routes.health import router as health_router
 from routes.streaming import router as streaming_router
 
 app = FastAPI(
+    root_path="/birdnet",
+    docs_url="/docs",
+    openapi_url="/openapi.json",
     title="BirdNET Prediction Service",
     description=(
         "Upload a mono audio file (mp3/wav) or raw PCM stream, "
