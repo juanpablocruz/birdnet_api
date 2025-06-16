@@ -13,7 +13,7 @@ from routes.health import router as health_router
 from routes.streaming import router as streaming_router
 
 app = FastAPI(
-    root_path="/birdnet",
+    root_path="/api/birdnet",
     docs_url="/docs",
     openapi_url="/openapi.json",
     title="BirdNET Prediction Service",
@@ -31,12 +31,14 @@ app.add_middleware(MaxSizeMiddleware)
 app.add_middleware(MetricsMiddleware)
 app.add_middleware(SlowAPIMiddleware)
 
+
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
         content={"error": "Too Many Requests", "details": str(exc.detail)},
     )
+
 
 app.include_router(predict_router)
 app.include_router(health_router)

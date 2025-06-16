@@ -6,7 +6,14 @@ from datetime import datetime, timezone, date as dtDate
 from typing import Annotated, Optional
 
 from birdnetlib import Recording
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPException, status
+from fastapi import (
+    APIRouter,
+    WebSocket,
+    WebSocketDisconnect,
+    Query,
+    HTTPException,
+    status,
+)
 from pydantic import BaseModel, Field
 
 from deps import analyzer
@@ -18,7 +25,13 @@ logger.setLevel(logging.DEBUG)
 
 router = APIRouter()
 
-def write_temp_wav(data: bytearray, sample_rate: int, channels: int, sample_width: int) -> str:
+PERSISTENT_DIR = os.getenv("RAW_AUDIO_PATH", "/data/biodex/raw")
+os.makedirs(PERSISTENT_DIR, exist_ok=True)
+
+
+def write_temp_wav(
+    data: bytearray, sample_rate: int, channels: int, sample_width: int
+) -> str:
     """
     Creates a temporary WAV file with the provided PCM data and returns the file path.
 
@@ -38,6 +51,30 @@ def write_temp_wav(data: bytearray, sample_rate: int, channels: int, sample_widt
             wav_file.setframerate(sample_rate)
             wav_file.writeframes(data)
         return tmp.name
+
+
+def write_persistent_wav(
+    data: bytes, sample_rate: int, channels: int, sample_width: int
+) -> str:
+    """
+    Guarda el WAV completo en la carpeta persistente y devuelve la ruta.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"stream_{timestamp}.wav"
+    path = os.path.join(PERSISTENT_DIR, filename)
+    try:
+        with wave.open(path, "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(sample_width)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(data)
+        logger.info("Saved full session audio to %s", path)
+    except Exception as e:
+        logger.error("Could not write persistent WAV %s: %s", path, e)
+        path = ""
+    return path
+
+
 def safe_remove(path: str):
     """
     Removes the specified file path if it exists. Logs a warning on failure.
@@ -47,7 +84,10 @@ def safe_remove(path: str):
     except Exception as e:
         logger.warning("Failed to remove temporary file %s: %s", path, e)
 
-def run_birdnet_on_file(file_path: str, lat: float, lon: float, date: dtDate, min_conf: float) -> list[dict]:
+
+def run_birdnet_on_file(
+    file_path: str, lat: float, lon: float, date: dtDate, min_conf: float
+) -> list[dict]:
     """
     Runs BirdNET detection on a WAV file and returns a list of detection results.
     """
@@ -127,6 +167,7 @@ async def websocket_realtime(
     """
     await websocket.accept()
 
+    logger.debug("Reques to ws")
     try:
         verify_token_or_close(token)
     except HTTPException:
@@ -134,7 +175,9 @@ async def websocket_realtime(
         return
 
     try:
+        logger.debug("Waiting for init")
         init_payload = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
+        logger.debug("Received init")
     except (asyncio.TimeoutError, WebSocketDisconnect):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
@@ -151,16 +194,17 @@ async def websocket_realtime(
     min_conf = init.min_conf
     timeout_seconds = init.timeout
 
-    if init.date is None:
-        recording_date = datetime.now(timezone.utc).date()
-    else:
-        recording_date = init.date
+    recording_date = (
+        init.date.date() if init.date else datetime.now(timezone.utc).date()
+    )
 
-    SAMPLE_RATE = 48000       # 48 kHz
-    CHANNELS = 1              # mono
-    SAMPLE_WIDTH = 2          # 16-bit = 2 bytes/sample
+    SAMPLE_RATE = 48000  # 48 kHz
+    CHANNELS = 1  # mono
+    SAMPLE_WIDTH = 2  # 16-bit = 2 bytes/sample
     WINDOW_SECONDS = 3
-    WINDOW_BYTES = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * WINDOW_SECONDS  # = 288000 bytes
+    WINDOW_BYTES = (
+        SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * WINDOW_SECONDS
+    )  # = 288000 bytes
     # First window is 3 s (288000 bytes), then 6 s (576000 bytes), then 9 s, etc.
 
     buffer = bytearray()
@@ -176,27 +220,33 @@ async def websocket_realtime(
                 return
 
             try:
-                msg = await asyncio.wait_for(websocket.receive_bytes(), timeout=1.0)
+                chunk = await asyncio.wait_for(websocket.receive_bytes(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
             except WebSocketDisconnect:
                 return
 
-            buffer.extend(msg)
-            logger.debug("Received %d bytes, total buffer = %d bytes", len(msg), len(buffer))
+            buffer.extend(chunk)
+            logger.debug(
+                "Received %d bytes, total buffer = %d bytes", len(chunk), len(buffer)
+            )
 
             if len(buffer) >= next_window_bytes:
                 logger.debug("Buffer ≥ %d → launching BirdNET", next_window_bytes)
 
                 try:
-                    wav_path = write_temp_wav(buffer[:next_window_bytes], SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH)
+                    wav_path = write_temp_wav(
+                        buffer[:next_window_bytes], SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH
+                    )
                 except Exception as e:
                     await websocket.send_json({"error": f"I/O error: {e}"})
                     await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
                     return
 
                 try:
-                    detections = run_birdnet_on_file(wav_path, lat, lon, recording_date, min_conf)
+                    detections = run_birdnet_on_file(
+                        wav_path, lat, lon, recording_date, min_conf
+                    )
                 except Exception as e:
                     safe_remove(wav_path)
                     await websocket.send_json({"error": f"BirdNET failed: {e}"})
@@ -205,14 +255,32 @@ async def websocket_realtime(
                 finally:
                     safe_remove(wav_path)
 
-                logger.debug("BirdNET returned %d detections for window %d s", len(detections), next_window_bytes // WINDOW_BYTES)
+                logger.debug(
+                    "BirdNET returned %d detections for window %d s",
+                    len(detections),
+                    next_window_bytes // WINDOW_BYTES,
+                )
                 for det in detections:
-                    logger.debug("    species = %s, confidence = %.3f", det['scientific_name'], det['confidence'])
+                    logger.debug(
+                        "    species = %s, confidence = %.3f",
+                        det["scientific_name"],
+                        det["confidence"],
+                    )
 
-                await websocket.send_json({"detections": sorted(detections, key=lambda d: d["confidence"], reverse=True)})
+                await websocket.send_json(
+                    {
+                        "detections": sorted(
+                            detections, key=lambda d: d["confidence"], reverse=True
+                        )
+                    }
+                )
 
                 next_window_bytes += WINDOW_BYTES
-                logger.debug("Next window will be %d bytes (%d s)", next_window_bytes, next_window_bytes // WINDOW_BYTES)
+                logger.debug(
+                    "Next window will be %d bytes (%d s)",
+                    next_window_bytes,
+                    next_window_bytes // WINDOW_BYTES,
+                )
 
     except WebSocketDisconnect:
         return
@@ -220,3 +288,7 @@ async def websocket_realtime(
         await websocket.send_json({"error": f"Server error: {e}"})
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
         return
+    finally:
+        if buffer:
+            write_persistent_wav(bytes(buffer), SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH)
+        await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
